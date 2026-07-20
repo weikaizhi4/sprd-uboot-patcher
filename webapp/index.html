@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unisoc U-Boot 补丁工具</title>
+  <style>
+    :root { --bg:#121813; --panel:#18211b; --ink:#edf4ee; --muted:#9baaa0; --line:#3a4b3f; --accent:#58c9a8; --accent-ink:#10221a; --danger:#ff9b8e; --code:#0e1510; }
+    * { box-sizing:border-box; }
+    [hidden] { display:none !important; }
+    body { margin:0; min-height:100vh; background:var(--bg); color:var(--ink); font:16px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { width:min(920px,calc(100% - 32px)); margin:0 auto; padding:34px 0 54px; }
+    header { display:flex; align-items:baseline; justify-content:space-between; gap:20px; padding-bottom:20px; border-bottom:1px solid var(--line); }
+    h1 { margin:0; font-size:25px; font-weight:650; }
+    header span,.muted { color:var(--muted); }
+    .workspace { padding:26px 0; }
+    form { display:grid; gap:18px; }
+    label { display:grid; gap:8px; font-weight:650; }
+    input,select { width:100%; min-height:44px; border:1px solid var(--line); border-radius:6px; padding:10px 12px; color:var(--ink); background:var(--panel); font:inherit; }
+    input[type="file"] { padding:9px; }
+    input:focus,select:focus { outline:2px solid var(--accent); outline-offset:1px; }
+    .address-row { display:grid; grid-template-columns:minmax(0,1fr) minmax(220px,0.8fr); gap:14px; align-items:end; }
+    .hint { min-height:44px; margin:0; padding:10px 12px; border-left:3px solid var(--line); color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+    .hint.ready { border-color:var(--accent); color:#c9e7da; }
+    .hint.error { border-color:var(--danger); color:var(--danger); }
+    button { justify-self:start; min-height:44px; border:0; border-radius:5px; padding:10px 16px; color:var(--accent-ink); background:var(--accent); font:650 16px inherit; cursor:pointer; }
+    button:hover { filter:brightness(1.07); }
+    button:disabled { cursor:wait; opacity:.55; }
+    .status { min-height:24px; margin:20px 0 0; color:var(--muted); }
+    .status.error { color:var(--danger); }
+    .result { margin-top:22px; padding-top:20px; border-top:1px solid var(--line); }
+    .result[hidden] { display:none; }
+    h2 { margin:0 0 14px; font-size:19px; font-weight:650; }
+    dl { display:grid; grid-template-columns:minmax(170px,240px) minmax(0,1fr); gap:8px 20px; margin:0 0 20px; }
+    dt { color:var(--muted); }
+    dd { margin:0; overflow-wrap:anywhere; }
+    code { padding:2px 5px; border-radius:4px; background:var(--code); font:13px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .download { display:inline-block; border-radius:5px; padding:10px 16px; color:var(--accent-ink); background:var(--accent); font-weight:650; text-decoration:none; }
+    .evidence { margin:6px 0 0; color:var(--muted); font-size:13px; }
+    @media (max-width:640px) { main { width:min(100% - 24px,920px); padding-top:22px; } header,.address-row { align-items:flex-start; grid-template-columns:1fr; flex-direction:column; gap:8px; } dl { grid-template-columns:1fr; gap:3px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header><h1>Unisoc U-Boot 补丁工具</h1><span>本地处理</span></header>
+    <section class="workspace" aria-label="补丁工具">
+      <form id="patch-form" onsubmit="return false">
+        <label>原版 U-Boot 文件
+          <input id="original-file" name="original" type="file" required>
+        </label>
+        <div class="address-row">
+          <label>Payload 加载地址
+            <input id="load-address" name="load_address" value="" placeholder="选择原版 U-Boot 后自动填充" spellcheck="false" required>
+          </label>
+          <p id="address-hint" class="hint">选择原版 U-Boot 后，自动从入口和 BTHD 结构推断地址。</p>
+        </div>
+        <label id="modified-row">修改后的 U-Boot 文件
+          <input id="modified-file" name="modified" type="file" required>
+        </label>
+        <label>目标架构
+          <select id="architecture" name="architecture"><option value="64">AArch64 / magic64</option><option value="32">ARM32 / magic32</option></select>
+        </label>
+        <button id="patch-button" type="button">生成补丁文件</button>
+      </form>
+      <p id="status" class="status" role="status"></p>
+    </section>
+    <section id="result" class="result" hidden aria-live="polite">
+      <h2>处理结果</h2>
+      <dl id="summary"></dl>
+      <a id="download" class="download" href="/" download>下载补丁文件</a>
+    </section>
+  </main>
+  <script>
+    const form = document.querySelector('#patch-form');
+    const originalFile = document.querySelector('#original-file');
+    const modifiedFile = document.querySelector('#modified-file');
+    const loadAddress = document.querySelector('#load-address');
+    const addressHint = document.querySelector('#address-hint');
+    const patchButton = document.querySelector('#patch-button');
+    const status = document.querySelector('#status');
+    const result = document.querySelector('#result');
+    const summary = document.querySelector('#summary');
+    const download = document.querySelector('#download');
+    const labels = { architecture:'架构', patch_entries:'补丁段数', patch_data_bytes:'补丁数据大小', expanded_bytes:'自动扩容', output_bytes:'有效镜像大小', magic_file:'中间 magic 镜像', signed_image_bytes:'原始有效镜像大小', reserved_padding_bytes:'分区尾部余量', source_partition_bytes:'源分区文件大小', final_partition_bytes:'最终文件大小', output_mode:'输出处理', appended_bytes:'追加字节数' };
+
+    function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, char => ({ '&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;' })[char]); }
+    function setStatus(message, error = false) { status.textContent = message; status.classList.toggle('error', error); }
+    function formatAddress(value) { return `0x${Number(value).toString(16).toUpperCase()}`; }
+    setStatus('选择修改版后，将原版与修改版的差异编码为运行时补丁。');
+
+    originalFile.addEventListener('change', async () => {
+      const file = originalFile.files[0];
+      if (!file) return;
+      addressHint.className = 'hint'; addressHint.textContent = '正在推断加载地址...';
+      const payload = new FormData(); payload.append('uboot', file, file.name);
+      try {
+        const response = await fetch('/api/infer-uboot', { method:'POST', body:payload });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '加载地址推断失败。');
+        const report = data.report;
+        if (report.candidate === null) throw new Error('未找到可信静态候选，请手工填写加载地址。');
+        loadAddress.value = formatAddress(report.candidate);
+        addressHint.className = 'hint ready';
+        addressHint.textContent = `已填入 ${loadAddress.value}。${report.evidence.at(-1)}`;
+        if (report.kind.includes('AArch64')) document.querySelector('#architecture').value = '64';
+      } catch (error) {
+        addressHint.className = 'hint error'; addressHint.textContent = error.message;
+      }
+    });
+
+    patchButton.addEventListener('click', async () => {
+      if (!originalFile.files[0] || !modifiedFile.files[0] || !loadAddress.value.trim()) {
+        setStatus('请先选择原版与修改版 U-Boot，并确认加载地址。', true); return;
+      }
+      patchButton.disabled = true; result.hidden = true; setStatus('正在生成 magic 并写入补丁...');
+      try {
+        const response = await fetch('/api/run', { method:'POST', body:new FormData(form) });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '处理失败。');
+        summary.innerHTML = Object.entries(data.summary).map(([key, value]) => `<dt>${escapeHtml(labels[key] || key)}</dt><dd>${escapeHtml(value)}</dd>`).join('');
+        download.href = data.download; download.download = data.file; download.textContent = `下载 ${data.file}`;
+        result.hidden = false; setStatus('补丁文件已生成。');
+      } catch (error) { setStatus(error.message || '处理失败。', true); }
+      finally { patchButton.disabled = false; }
+    });
+  </script>
+</body>
+</html>
